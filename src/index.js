@@ -47,6 +47,8 @@ const N8N_INCOMING_WEBHOOK =
 
 const QR_TTL_MS = 60_000;
 const WATCHDOG_INTERVAL_MS = 5_000;
+const AUTH_ROOT = path.resolve(__dirname, 'auth');
+const AUTO_PURGE_ON_LOGOUT = process.env.AUTO_PURGE_ON_LOGOUT === '1';
 
 /* ========= Swagger (OpenAPI) ========= */
 let openapi = null;
@@ -71,25 +73,22 @@ function upsertSession(sessionId, patch) {
 async function startSession(sessionId) {
   const existing = sessions.get(sessionId);
 
-  // Si hay sock pero está muerto, no retornes
   const isAlive =
     !!existing?.sock?.ws && existing.sock.ws.readyState === 1; // 1 = OPEN
   if (isAlive) return existing;
 
-  const { state, saveCreds } = await useMultiFileAuthState(path.join('./auth', sessionId));
+  const { state, saveCreds } = await useMultiFileAuthState(path.join(AUTH_ROOT, sessionId));
 
   const browserInfo =
     Browsers && typeof Browsers.appropriate === 'function'
       ? Browsers.appropriate('Chrome')
       : ['Chrome', 'Linux', '110.0.0'];
 
-  // Asegura versión compatible
   const { version } = await fetchLatestBaileysVersion();
 
   const sock = makeWASocket({
     version,
     browser: browserInfo,
-    printQRInTerminal: true, // imprime QR en consola
     auth: {
       creds: state.creds,
       keys: makeCacheableSignalKeyStore(state.keys),
@@ -107,12 +106,10 @@ async function startSession(sessionId) {
 
   sock.ev.on('creds.update', saveCreds);
 
-  // Limpia timer viejo si existía
   if (existing?.qrTimer) {
     try { clearInterval(existing.qrTimer); } catch (_) {}
   }
 
-  // Watchdog que invalida/rota QR si no se escanea en TTL
   const qrTimer = setInterval(() => {
     const s = sessions.get(sessionId);
     if (!s) { try { clearInterval(qrTimer); } catch (_) {} return; }
@@ -149,6 +146,14 @@ async function startSession(sessionId) {
         : 0;
 
       console.log(`[${sessionId}] 🔌 Conexión cerrada. Código: ${statusCode}`);
+
+      if (statusCode === DisconnectReason.loggedOut && AUTO_PURGE_ON_LOGOUT) {
+        const dir = path.join(AUTH_ROOT, sessionId);
+        try {
+          if (fs.existsSync(dir)) fs.rmSync(dir, { recursive: true, force: true });
+          console.log(`[${sessionId}] 🧹 Purga automática de credenciales por 401`);
+        } catch {}
+      }
 
       const shouldRestart = statusCode !== DisconnectReason.loggedOut;
       if (shouldRestart) {
@@ -273,7 +278,6 @@ app.post('/sessions/:id/qr/refresh', async (req, res) => {
       ok: true,
       sessionId: id,
       status: s?.status || 'connecting',
-      // el QR puede tardar unos ms en llegar vía event; sigue consultando GET /sessions/:id/qr
       qr: s?.qr || null,
       qrAt: s?.qrAt || null,
       lastUpdate: s?.lastUpdate || null,
@@ -287,24 +291,24 @@ app.post('/sessions/:id/qr/refresh', async (req, res) => {
 app.delete('/sessions/:id', async (req, res) => {
   const id = req.params.id;
   const s = sessions.get(id);
-  if (!s) return res.status(404).json({ error: 'session_not_found' });
   try {
-    if (s.sock) {
+    if (s?.sock) {
       await s.sock.logout().catch(() => {});
       try { s.sock.end?.(); } catch (_) {}
       try { s.sock.ws?.close?.(); } catch (_) {}
     }
-    try { clearInterval(s.qrTimer); } catch (_) {}
+    try { clearInterval(s?.qrTimer); } catch (_) {}
   } finally {
     sessions.delete(id);
+    const dir = path.join(AUTH_ROOT, id);
+    try { if (fs.existsSync(dir)) fs.rmSync(dir, { recursive: true, force: true }); } catch {}
   }
   res.json({ ok: true, sessionId: id });
 });
 
-/* ========= Hard reset: borra credenciales para forzar nuevo QR ========= */
 app.post('/sessions/:id/reset', async (req, res) => {
   const id = req.params.id;
-  const dir = path.join(__dirname, 'auth', id);
+  const dir = path.join(AUTH_ROOT, id);
   try {
     const s = sessions.get(id);
     if (s?.sock) {
@@ -325,7 +329,6 @@ app.post('/sessions/:id/reset', async (req, res) => {
   }
 });
 
-/* ========= Send text ========= */
 app.post('/messages', async (req, res) => {
   try {
     const { sessionId, to, text } = req.body;
