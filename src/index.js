@@ -43,7 +43,7 @@ app.use(body.json({ limit: '2mb' }));
 const PORT = process.env.PORT || 4000;
 const N8N_INCOMING_WEBHOOK =
   process.env.N8N_INCOMING_WEBHOOK ||
-  'https://n8n.srv957249.hstgr.cloud/webhook-test/d450b539-4fd4-4e95-a43a-68805849b7aa';
+  'https://n8n.srv957249.hstgr.cloud/webhook/webhook/wa-in';
 
 const QR_TTL_MS = 60_000;
 const WATCHDOG_INTERVAL_MS = 5_000;
