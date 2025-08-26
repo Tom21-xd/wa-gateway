@@ -30,6 +30,8 @@ process.on('uncaughtException', (err) => {
 const wait = (ms) => new Promise((r) => setTimeout(r, ms));
 
 async function httpFetch(url, init) {
+  const method = (init && init.method) || 'GET';
+  console.log(`🌐 httpFetch -> ${method} ${url}`);
   if (typeof globalThis.fetch === 'function') return globalThis.fetch(url, init);
   const { default: nodeFetch } = await import('node-fetch');
   return nodeFetch(url, init);
@@ -39,6 +41,30 @@ async function httpFetch(url, init) {
 const app = express();
 app.use(cors());
 app.use(body.json({ limit: '2mb' }));
+
+// 🔎 Middleware de tracing por request
+app.use((req, res, next) => {
+  const rid = (Math.random() + 1).toString(36).slice(2, 8);
+  req.rid = rid;
+  const start = Date.now();
+
+  // Evitar logs gigantes: truncamos body
+  const shortBody =
+    req.method !== 'GET' && req.body
+      ? JSON.stringify(req.body).slice(0, 600)
+      : '';
+
+  console.log(`[${rid}] ➡️ ${req.method} ${req.originalUrl} body=${shortBody || '<empty>'}`);
+
+  res.on('finish', () => {
+    const ms = Date.now() - start;
+    console.log(
+      `[${rid}] ⬅️ ${res.statusCode} ${req.method} ${req.originalUrl} (${ms}ms)`
+    );
+  });
+
+  next();
+});
 
 const PORT = process.env.PORT || 4000;
 const N8N_INCOMING_WEBHOOK =
@@ -55,6 +81,7 @@ let openapi = null;
 try {
   openapi = JSON.parse(fs.readFileSync(path.join(__dirname, 'openapi.json'), 'utf8'));
   app.use('/docs', swaggerUi.serve, swaggerUi.setup(openapi, { explorer: true }));
+  console.log('📑 Swagger habilitado en /docs');
 } catch (e) {
   console.warn('⚠️ No se encontró openapi.json; se omite /docs');
 }
@@ -66,18 +93,25 @@ function upsertSession(sessionId, patch) {
   const prev = sessions.get(sessionId) || {};
   const next = { ...prev, ...patch, lastUpdate: Date.now() };
   sessions.set(sessionId, next);
+  const keysPatched = Object.keys(patch);
+  console.log(`[${sessionId}] 🧩 upsertSession -> patched: ${keysPatched.join(', ') || 'none'}`);
   return next;
 }
 
 /* ========= Core: start session ========= */
 async function startSession(sessionId) {
+  console.log(`[${sessionId}] ▶️ startSession() llamado`);
   const existing = sessions.get(sessionId);
 
   const isAlive =
     !!existing?.sock?.ws && existing.sock.ws.readyState === 1; // 1 = OPEN
-  if (isAlive) return existing;
+  if (isAlive) {
+    console.log(`[${sessionId}] ♻️ startSession() reutiliza socket vivo`);
+    return existing;
+  }
 
   const { state, saveCreds } = await useMultiFileAuthState(path.join(AUTH_ROOT, sessionId));
+  console.log(`[${sessionId}] 🔑 Credenciales cargadas (multi-file)`);
 
   const browserInfo =
     Browsers && typeof Browsers.appropriate === 'function'
@@ -85,6 +119,7 @@ async function startSession(sessionId) {
       : ['Chrome', 'Linux', '110.0.0'];
 
   const { version } = await fetchLatestBaileysVersion();
+  console.log(`[${sessionId}] 📦 Baileys version negociada: ${version?.join?.('.') || version}`);
 
   const sock = makeWASocket({
     version,
@@ -104,10 +139,14 @@ async function startSession(sessionId) {
     startedAt: Date.now(),
   });
 
-  sock.ev.on('creds.update', saveCreds);
+  sock.ev.on('creds.update', (...args) => {
+    console.log(`[${sessionId}] 💾 creds.update`);
+    saveCreds(...args);
+  });
 
-  if (existing?.qrTimer) {
-    try { clearInterval(existing.qrTimer); } catch (_) {}
+  const existingTimer = existing?.qrTimer;
+  if (existingTimer) {
+    try { clearInterval(existingTimer); } catch (_) {}
   }
 
   const qrTimer = setInterval(() => {
@@ -160,6 +199,7 @@ async function startSession(sessionId) {
         upsertSession(sessionId, { status: 'connecting' });
         await wait(1500);
         try {
+          console.log(`[${sessionId}] 🔁 Reintentando startSession() tras cierre`);
           await startSession(sessionId);
         } catch (err) {
           console.error(`[${sessionId}] ❌ Falló reinicio:`, err?.message || err);
@@ -187,29 +227,36 @@ async function startSession(sessionId) {
       m.message?.imageMessage?.caption ||
       m.message?.videoMessage?.caption ||
       '';
+    console.log(
+      `[${sessionId}] ✉️ inbound from=${m.key.remoteJid} type=${Object.keys(m.message || {}).join(',')}`
+    );
     try {
       await httpFetch(N8N_INCOMING_WEBHOOK, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ sessionId, from: m.key.remoteJid, text, raw: m }),
       });
+      console.log(`[${sessionId}] 🔁 reenviado a n8n (len=${text?.length || 0})`);
     } catch (e) {
       console.error(`[${sessionId}] ⚠️ Error enviando a n8n:`, e?.message || e);
     }
   });
 
+  console.log(`[${sessionId}] ◀️ startSession() listo (status=${sessions.get(sessionId)?.status})`);
   return sessions.get(sessionId);
 }
 
 /* ========= Helpers ========= */
 async function forceQR(sessionId) {
+  console.log(`[${sessionId}] ♻️ forceQR() llamado`);
   let s = sessions.get(sessionId);
   if (!s) {
+    console.log(`[${sessionId}] forceQR() -> no había sesión, iniciando`);
     s = await startSession(sessionId);
     return sessions.get(sessionId);
   }
 
-  console.log(`[${sessionId}] ♻️ Forzando refresco de QR`);
+  console.log(`[${sessionId}] forceQR() -> refrescando QR`);
   try { s.qr = null; } catch (_) {}
   try { s.qrAt = null; } catch (_) {}
   try { s.sock?.ws?.close?.(); } catch (_) {}
@@ -217,14 +264,17 @@ async function forceQR(sessionId) {
 
   await startSession(sessionId);
 
+  console.log(`[${sessionId}] forceQR() -> completado`);
   return sessions.get(sessionId);
 }
 
 /* ========= Routes ========= */
 app.post('/sessions/:id/start', async (req, res) => {
+  console.log(`[${req.rid}] [ROUTE] POST /sessions/:id/start id=${req.params.id}`);
   try {
     const id = req.params.id;
     const s = await startSession(id);
+    console.log(`[${req.rid}] [ROUTE] start -> status=${s.status}`);
     return res.json({
       sessionId: id,
       status: s.status || 'connecting',
@@ -233,14 +283,18 @@ app.post('/sessions/:id/start', async (req, res) => {
       lastUpdate: s.lastUpdate || Date.now(),
     });
   } catch (e) {
-    console.error('start_failed:', e?.message || e);
+    console.error(`[${req.rid}] start_failed:`, e?.message || e);
     return res.status(500).json({ error: 'start_failed' });
   }
 });
 
 app.get('/sessions/:id/status', (req, res) => {
+  console.log(`[${req.rid}] [ROUTE] GET /sessions/:id/status id=${req.params.id}`);
   const s = sessions.get(req.params.id);
-  if (!s) return res.status(404).json({ error: 'session_not_found' });
+  if (!s) {
+    console.warn(`[${req.rid}] session_not_found`);
+    return res.status(404).json({ error: 'session_not_found' });
+  }
   return res.json({
     sessionId: req.params.id,
     status: s.status || 'inactive',
@@ -251,12 +305,17 @@ app.get('/sessions/:id/status', (req, res) => {
 });
 
 app.get('/sessions/:id/qr', (req, res) => {
+  console.log(`[${req.rid}] [ROUTE] GET /sessions/:id/qr id=${req.params.id}`);
   const s = sessions.get(req.params.id);
-  if (!s) return res.status(404).json({ error: 'session_not_found' });
+  if (!s) {
+    console.warn(`[${req.rid}] session_not_found`);
+    return res.status(404).json({ error: 'session_not_found' });
+  }
   return res.json({ sessionId: req.params.id, qr: s.qr || null, qrAt: s.qrAt || null });
 });
 
 app.get('/sessions', (req, res) => {
+  console.log(`[${req.rid}] [ROUTE] GET /sessions`);
   const all = [];
   for (const [id, s] of sessions.entries()) {
     all.push({
@@ -271,6 +330,7 @@ app.get('/sessions', (req, res) => {
 });
 
 app.post('/sessions/:id/qr/refresh', async (req, res) => {
+  console.log(`[${req.rid}] [ROUTE] POST /sessions/:id/qr/refresh id=${req.params.id}`);
   const id = req.params.id;
   try {
     const s = await forceQR(id);
@@ -283,16 +343,18 @@ app.post('/sessions/:id/qr/refresh', async (req, res) => {
       lastUpdate: s?.lastUpdate || null,
     });
   } catch (e) {
-    console.error('qr_refresh_failed:', e?.message || e);
+    console.error(`[${req.rid}] qr_refresh_failed:`, e?.message || e);
     return res.status(500).json({ error: 'qr_refresh_failed' });
   }
 });
 
 app.delete('/sessions/:id', async (req, res) => {
+  console.log(`[${req.rid}] [ROUTE] DELETE /sessions/:id id=${req.params.id}`);
   const id = req.params.id;
   const s = sessions.get(id);
   try {
     if (s?.sock) {
+      console.log(`[${req.rid}] logout/end socket`);
       await s.sock.logout().catch(() => {});
       try { s.sock.end?.(); } catch (_) {}
       try { s.sock.ws?.close?.(); } catch (_) {}
@@ -301,17 +363,24 @@ app.delete('/sessions/:id', async (req, res) => {
   } finally {
     sessions.delete(id);
     const dir = path.join(AUTH_ROOT, id);
-    try { if (fs.existsSync(dir)) fs.rmSync(dir, { recursive: true, force: true }); } catch {}
+    try {
+      if (fs.existsSync(dir)) {
+        fs.rmSync(dir, { recursive: true, force: true });
+        console.log(`[${req.rid}] auth dir purgado: ${dir}`);
+      }
+    } catch {}
   }
   res.json({ ok: true, sessionId: id });
 });
 
 app.post('/sessions/:id/reset', async (req, res) => {
+  console.log(`[${req.rid}] [ROUTE] POST /sessions/:id/reset id=${req.params.id}`);
   const id = req.params.id;
   const dir = path.join(AUTH_ROOT, id);
   try {
     const s = sessions.get(id);
     if (s?.sock) {
+      console.log(`[${req.rid}] reset -> logout/end socket`);
       await s.sock.logout().catch(() => {});
       try { s.sock.end?.(); } catch (_) {}
       try { s.sock.ws?.close?.(); } catch (_) {}
@@ -319,33 +388,43 @@ app.post('/sessions/:id/reset', async (req, res) => {
     try { clearInterval(s?.qrTimer); } catch (_) {}
     sessions.delete(id);
 
-    if (fs.existsSync(dir)) fs.rmSync(dir, { recursive: true, force: true });
+    if (fs.existsSync(dir)) {
+      fs.rmSync(dir, { recursive: true, force: true });
+      console.log(`[${req.rid}] reset -> auth dir borrado: ${dir}`);
+    }
 
     const ns = await startSession(id);
+    console.log(`[${req.rid}] reset -> nueva sesión status=${ns?.status}`);
     return res.json({ ok: true, sessionId: id, status: ns?.status || 'connecting' });
   } catch (e) {
-    console.error('reset_failed:', e?.message || e);
+    console.error(`[${req.rid}] reset_failed:`, e?.message || e);
     return res.status(500).json({ error: 'reset_failed' });
   }
 });
 
 app.post('/messages', async (req, res) => {
+  console.log(`mensaje recibido`, req.body);
   try {
     const { sessionId, to, text } = req.body;
+    console.log(`[${req.rid}] send -> sessionId=${sessionId} to=${to} len=${(text || '').length}`);
     const s = sessions.get(sessionId);
     if (!s || !s.sock) return res.status(404).json({ error: 'session_not_found_or_inactive' });
     if (s.status !== 'active') return res.status(409).json({ error: 'session_not_active' });
     const jid = to.includes('@') ? to : `${to}@s.whatsapp.net`;
     const r = await s.sock.sendMessage(jid, { text });
+    console.log(`[${req.rid}] send -> ok id=${r?.key?.id}`);
     res.json({ ok: true, response: r });
   } catch (e) {
-    console.error('send_failed:', e?.message || e);
+    console.error(`[${req.rid}] send_failed:`, e?.message || e);
     res.status(500).json({ error: 'send_failed' });
   }
 });
 
 /* ========= Health ========= */
-app.get('/health', (req, res) => res.json({ ok: true }));
+app.get('/health', (req, res) => {
+  console.log(`[${req.rid}] [ROUTE] GET /health`);
+  res.json({ ok: true });
+});
 
 /* ========= Listen ========= */
 app.listen(PORT, () => {
