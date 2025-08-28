@@ -1,56 +1,74 @@
 {
   "openapi": "3.0.3",
   "info": {
-    "title": "WA Gateway API",
-    "version": "1.0.0",
-    "description": "API para gestionar sesiones de WhatsApp (Baileys) y envío de mensajes. Incluye regeneración automática de QR."
+    "title": "WA Gateway",
+    "description": "API para gestionar sesiones de WhatsApp (Baileys) y envío de mensajes con buenas prácticas anti-spam.",
+    "version": "1.0.0"
   },
   "servers": [
     { "url": "http://localhost:4000", "description": "Local" }
   ],
   "tags": [
-    { "name": "Sessions", "description": "Gestión de sesiones" },
-    { "name": "Messages", "description": "Envío de mensajes" },
-    { "name": "Health", "description": "Estado del servicio" }
+    { "name": "Health" },
+    { "name": "Sessions" },
+    { "name": "Messaging" }
   ],
   "paths": {
-    "/sessions/{id}/start": {
-      "post": {
-        "tags": ["Sessions"],
-        "summary": "Crear/Iniciar una sesión",
-        "parameters": [
-          {
-            "name": "id",
-            "in": "path",
-            "required": true,
-            "schema": { "type": "string" },
-            "description": "Identificador arbitrario de la sesión"
-          }
-        ],
+    "/health": {
+      "get": {
+        "tags": ["Health"],
+        "summary": "Revisar estado del servicio",
         "responses": {
           "200": {
-            "description": "Sesión creada o ya existente",
+            "description": "OK",
             "content": {
               "application/json": {
-                "schema": { "$ref": "#/components/schemas/Session" },
+                "schema": { "$ref": "#/components/schemas/HealthResponse" },
                 "examples": {
-                  "ok": {
-                    "value": {
-                      "sessionId": "MiEmpresa",
-                      "status": "connecting",
-                      "qr": "XXXX",
-                      "startedAt": 1724150000000,
-                      "lastUpdate": 1724150000000
-                    }
-                  }
+                  "ok": { "value": { "ok": true } }
                 }
               }
             }
-          },
-          "500": {
-            "description": "Error al iniciar",
-            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
           }
+        }
+      }
+    },
+    "/sessions": {
+      "get": {
+        "tags": ["Sessions"],
+        "summary": "Listar todas las sesiones en memoria",
+        "responses": {
+          "200": {
+            "description": "Listado de sesiones",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": { "$ref": "#/components/schemas/SessionListItem" }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/sessions/{id}/start": {
+      "post": {
+        "tags": ["Sessions"],
+        "summary": "Iniciar o reutilizar una sesión",
+        "parameters": [
+          { "$ref": "#/components/parameters/SessionIdParam" }
+        ],
+        "responses": {
+          "200": {
+            "description": "Sesión iniciada o en progreso",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/SessionStartResponse" }
+              }
+            }
+          },
+          "500": { "$ref": "#/components/responses/ServerError" }
         }
       }
     },
@@ -59,78 +77,104 @@
         "tags": ["Sessions"],
         "summary": "Obtener estado de una sesión",
         "parameters": [
-          { "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }
+          { "$ref": "#/components/parameters/SessionIdParam" }
         ],
         "responses": {
           "200": {
-            "description": "Estado actual",
-            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/SessionStatus" } } }
+            "description": "Estado de sesión",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/SessionStatusResponse" }
+              }
+            }
           },
-          "404": {
-            "description": "Sesión no encontrada",
-            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
-          }
+          "404": { "$ref": "#/components/responses/NotFound" }
         }
       }
     },
     "/sessions/{id}/qr": {
       "get": {
         "tags": ["Sessions"],
-        "summary": "Obtener último QR de la sesión",
+        "summary": "Obtener el QR vigente de la sesión (si hay)",
         "parameters": [
-          { "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }
+          { "$ref": "#/components/parameters/SessionIdParam" }
         ],
         "responses": {
           "200": {
-            "description": "Último QR recibido para esa sesión",
-            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/SessionQR" } } }
+            "description": "QR actual o null",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/SessionQRResponse" }
+              }
+            }
           },
-          "404": {
-            "description": "Sesión no encontrada",
-            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
-          }
+          "404": { "$ref": "#/components/responses/NotFound" }
         }
       }
     },
-    "/sessions": {
-      "get": {
+    "/sessions/{id}/qr/refresh": {
+      "post": {
         "tags": ["Sessions"],
-        "summary": "Listar todas las sesiones",
+        "summary": "Forzar refresco de QR (con throttling interno)",
+        "parameters": [
+          { "$ref": "#/components/parameters/SessionIdParam" }
+        ],
         "responses": {
           "200": {
-            "description": "Listado de sesiones",
+            "description": "QR actualizado o en camino",
             "content": {
               "application/json": {
-                "schema": { "type": "array", "items": { "$ref": "#/components/schemas/SessionSummary" } }
+                "schema": { "$ref": "#/components/schemas/SessionQRRefreshResponse" }
               }
             }
-          }
+          },
+          "500": { "$ref": "#/components/responses/ServerError" }
         }
       }
     },
     "/sessions/{id}": {
       "delete": {
         "tags": ["Sessions"],
-        "summary": "Cerrar y eliminar una sesión",
+        "summary": "Eliminar sesión, cerrar socket y purgar credenciales",
         "parameters": [
-          { "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }
+          { "$ref": "#/components/parameters/SessionIdParam" }
         ],
         "responses": {
           "200": {
             "description": "Sesión eliminada",
-            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/DeleteOk" } } }
-          },
-          "404": {
-            "description": "Sesión no encontrada",
-            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/SimpleOkResponse" }
+              }
+            }
           }
+        }
+      }
+    },
+    "/sessions/{id}/reset": {
+      "post": {
+        "tags": ["Sessions"],
+        "summary": "Resetear sesión: logout, borrar auth y re-iniciar",
+        "parameters": [
+          { "$ref": "#/components/parameters/SessionIdParam" }
+        ],
+        "responses": {
+          "200": {
+            "description": "Sesión reseteada",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/SessionResetResponse" }
+              }
+            }
+          },
+          "500": { "$ref": "#/components/responses/ServerError" }
         }
       }
     },
     "/messages": {
       "post": {
-        "tags": ["Messages"],
-        "summary": "Enviar un mensaje",
+        "tags": ["Messaging"],
+        "summary": "Enviar mensaje de texto a un JID/numero",
         "requestBody": {
           "required": true,
           "content": {
@@ -138,7 +182,11 @@
               "schema": { "$ref": "#/components/schemas/MessageSendRequest" },
               "examples": {
                 "basic": {
-                  "value": { "sessionId": "MiEmpresa", "to": "573001112233", "text": "Hola 👋" }
+                  "value": {
+                    "sessionId": "MiEmpresa",
+                    "to": "573001112233",
+                    "text": "Hola, ¿cómo estás?"
+                  }
                 }
               }
             }
@@ -153,115 +201,193 @@
               }
             }
           },
-          "404": {
-            "description": "Sesión no encontrada o inactiva",
-            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": {
+            "description": "El destinatario tiene opt-out",
+            "content": {
+              "application/json": { "schema": { "$ref": "#/components/schemas/Error" } }
+            }
           },
+          "404": { "$ref": "#/components/responses/NotFoundSession" },
           "409": {
-            "description": "Sesión no está activa",
-            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+            "description": "La sesión no está activa",
+            "content": {
+              "application/json": { "schema": { "$ref": "#/components/schemas/Error" } }
+            }
           },
-          "500": {
-            "description": "Fallo de envío",
-            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
-          }
-        }
-      }
-    },
-    "/health": {
-      "get": {
-        "tags": ["Health"],
-        "summary": "Healthcheck",
-        "responses": {
-          "200": {
-            "description": "OK",
-            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Health" } } }
-          }
+          "423": {
+            "description": "Fuera de horario permitido",
+            "content": {
+              "application/json": { "schema": { "$ref": "#/components/schemas/Error" } }
+            }
+          },
+          "429": {
+            "description": "Rate limit o cap diario alcanzado",
+            "content": {
+              "application/json": { "schema": { "$ref": "#/components/schemas/Error" } }
+            }
+          },
+          "503": {
+            "description": "Sesión pausada temporalmente",
+            "content": {
+              "application/json": { "schema": { "$ref": "#/components/schemas/Error" } }
+            }
+          },
+          "500": { "$ref": "#/components/responses/ServerError" }
         }
       }
     }
   },
   "components": {
+    "parameters": {
+      "SessionIdParam": {
+        "name": "id",
+        "in": "path",
+        "required": true,
+        "schema": { "type": "string", "example": "MiEmpresa" }
+      }
+    },
     "schemas": {
-      "Session": {
+      "HealthResponse": {
         "type": "object",
-        "properties": {
-          "sessionId": { "type": "string" },
-          "status": { "type": "string", "enum": ["connecting", "active", "inactive"] },
-          "qr": { "type": "string", "nullable": true },
-          "startedAt": { "type": "integer", "format": "int64", "nullable": true },
-          "lastUpdate": { "type": "integer", "format": "int64" }
-        },
-        "required": ["sessionId", "status", "lastUpdate"]
+        "properties": { "ok": { "type": "boolean", "example": true } },
+        "required": ["ok"]
       },
-      "SessionStatus": {
+      "SimpleOkResponse": {
+        "type": "object",
+        "properties": {
+          "ok": { "type": "boolean", "example": true },
+          "sessionId": { "type": "string", "example": "MiEmpresa" }
+        },
+        "required": ["ok", "sessionId"]
+      },
+      "SessionListItem": {
         "type": "object",
         "properties": {
           "sessionId": { "type": "string" },
-          "status": { "type": "string", "enum": ["connecting", "active", "inactive"] },
+          "status": { "type": "string", "enum": ["inactive", "connecting", "active"] },
           "hasQR": { "type": "boolean" },
-          "lastUpdate": { "type": "integer", "format": "int64", "nullable": true },
-          "startedAt": { "type": "integer", "format": "int64", "nullable": true }
+          "startedAt": { "type": "integer", "nullable": true, "description": "epoch ms" },
+          "lastUpdate": { "type": "integer", "nullable": true, "description": "epoch ms" }
         },
         "required": ["sessionId", "status", "hasQR"]
       },
-      "SessionQR": {
+      "SessionStartResponse": {
+        "type": "object",
+        "properties": {
+          "sessionId": { "type": "string" },
+          "status": { "type": "string", "enum": ["connecting", "active", "inactive"] },
+          "qr": { "type": "string", "nullable": true },
+          "startedAt": { "type": "integer", "nullable": true },
+          "lastUpdate": { "type": "integer", "nullable": true }
+        },
+        "required": ["sessionId", "status"]
+      },
+      "SessionStatusResponse": {
+        "type": "object",
+        "properties": {
+          "sessionId": { "type": "string" },
+          "status": { "type": "string", "enum": ["inactive", "connecting", "active"] },
+          "hasQR": { "type": "boolean" },
+          "qrAt": { "type": "integer", "nullable": true },
+          "msToExpire": { "type": "integer", "nullable": true },
+          "lastUpdate": { "type": "integer", "nullable": true },
+          "startedAt": { "type": "integer", "nullable": true }
+        },
+        "required": ["sessionId", "status", "hasQR"]
+      },
+      "SessionQRResponse": {
         "type": "object",
         "properties": {
           "sessionId": { "type": "string" },
           "qr": { "type": "string", "nullable": true },
-          "qrAt": { "type": "integer", "format": "int64", "nullable": true }
+          "qrAt": { "type": "integer", "nullable": true }
         },
         "required": ["sessionId"]
       },
-      "SessionSummary": {
+      "SessionQRRefreshResponse": {
         "type": "object",
         "properties": {
+          "ok": { "type": "boolean", "example": true },
           "sessionId": { "type": "string" },
           "status": { "type": "string", "enum": ["connecting", "active", "inactive"] },
-          "hasQR": { "type": "boolean" },
-          "startedAt": { "type": "integer", "format": "int64", "nullable": true },
-          "lastUpdate": { "type": "integer", "format": "int64", "nullable": true }
+          "qr": { "type": "string", "nullable": true },
+          "qrAt": { "type": "integer", "nullable": true },
+          "lastUpdate": { "type": "integer", "nullable": true }
         },
-        "required": ["sessionId", "status", "hasQR"]
+        "required": ["ok", "sessionId", "status"]
       },
-      "DeleteOk": {
+      "SessionResetResponse": {
         "type": "object",
         "properties": {
-          "ok": { "type": "boolean" },
-          "sessionId": { "type": "string" }
+          "ok": { "type": "boolean", "example": true },
+          "sessionId": { "type": "string" },
+          "status": { "type": "string", "enum": ["connecting", "active", "inactive"] }
         },
-        "required": ["ok", "sessionId"]
+        "required": ["ok", "sessionId", "status"]
       },
       "MessageSendRequest": {
         "type": "object",
         "properties": {
-          "sessionId": { "type": "string" },
-          "to": { "type": "string", "description": "MSISDN sin @s.whatsapp.net" },
-          "text": { "type": "string" }
+          "sessionId": { "type": "string", "example": "MiEmpresa" },
+          "to": {
+            "type": "string",
+            "description": "Número en formato internacional o JID. Si no incluye @, se convertirá a {numero}@s.whatsapp.net",
+            "example": "573001112233"
+          },
+          "text": { "type": "string", "example": "Hola, ¿cómo estás?" }
         },
         "required": ["sessionId", "to", "text"]
       },
       "MessageSendResponse": {
         "type": "object",
         "properties": {
-          "ok": { "type": "boolean" },
-          "response": { "type": "object" }
+          "ok": { "type": "boolean", "example": true },
+          "response": { "type": "object", "description": "Objeto de respuesta Baileys" }
         },
-        "required": ["ok"]
-      },
-      "Health": {
-        "type": "object",
-        "properties": { "ok": { "type": "boolean" } },
         "required": ["ok"]
       },
       "Error": {
         "type": "object",
         "properties": {
-          "error": { "type": "string" }
+          "error": { "type": "string", "example": "session_not_active" }
         },
         "required": ["error"]
       }
+    },
+    "responses": {
+      "BadRequest": {
+        "description": "Solicitud inválida",
+        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+      },
+      "Unauthorized": {
+        "description": "Falta o es inválida la API key",
+        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+      },
+      "NotFound": {
+        "description": "Recurso no encontrado",
+        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+      },
+      "NotFoundSession": {
+        "description": "Sesión no encontrada o inactiva",
+        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+      },
+      "ServerError": {
+        "description": "Error interno",
+        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+      }
+    },
+    "securitySchemes": {
+      "ApiKeyHeader": {
+        "type": "apiKey",
+        "in": "header",
+        "name": "x-api-key",
+        "description": "API key opcional (si está configurada en el servidor)."
+      }
     }
-  }
+  },
+  "security": [
+    { "ApiKeyHeader": [] }
+  ]
 }
