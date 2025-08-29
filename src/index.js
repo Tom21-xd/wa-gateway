@@ -1,5 +1,4 @@
-// index.js
-/* ========= Imports ========= */
+
 const express = require('express');
 const cors = require('cors');
 const body = require('body-parser');
@@ -20,7 +19,6 @@ const {
 } = require('@whiskeysockets/baileys');
 const { Boom } = require('@hapi/boom');
 
-/* ========= Safety: no-crash ========= */
 process.on('unhandledRejection', (reason) => {
   console.error('🧨 UnhandledRejection:', reason);
 });
@@ -28,7 +26,6 @@ process.on('uncaughtException', (err) => {
   console.error('🧨 UncaughtException:', err);
 });
 
-/* ========= Utils ========= */
 const wait = (ms) => new Promise((r) => setTimeout(r, ms));
 function jitter(ms, spread = 0.4) {
   const delta = ms * spread;
@@ -81,15 +78,13 @@ function extractTextFromMessage(msg) {
   );
 }
 
-/* ========= App setup ========= */
 const app = express();
 app.use(cors({
-  origin: (origin, cb) => cb(null, true), // ajusta a dominios permitidos si expones público
+  origin: (origin, cb) => cb(null, true), // AJUSTA dominios si expones público
   credentials: false
 }));
 app.use(body.json({ limit: '2mb' }));
 
-// 🔐 API Key (opcional): exige x-api-key si está definida
 const API_KEY = process.env.API_KEY || '';
 app.use((req, res, next) => {
   if (!API_KEY) return next();
@@ -98,15 +93,11 @@ app.use((req, res, next) => {
   next();
 });
 
-// 🔎 Middleware de tracing por request
 app.use((req, res, next) => {
   const rid = (Math.random() + 1).toString(36).slice(2, 8);
   req.rid = rid;
   const start = Date.now();
-  const shortBody =
-    req.method !== 'GET' && req.body
-      ? JSON.stringify(req.body).slice(0, 600)
-      : '';
+  const shortBody = req.method !== 'GET' && req.body ? JSON.stringify(req.body).slice(0, 600) : '';
   console.log(`[${rid}] ➡️ ${req.method} ${req.originalUrl} body=${shortBody || '<empty>'}`);
   res.on('finish', () => {
     const ms = Date.now() - start;
@@ -134,48 +125,99 @@ try {
   console.warn('⚠️ No se encontró openapi.json; se omite /docs');
 }
 
-/* ========= In-memory state ========= */
 const sessions = new Map();
-const sessionLocks = new Map();      // locks de concurrencia start/reset
-const reconnectState = new Map();    // backoff por sesión
-const lastForce = new Map();         // throttle forceQR
-const dailyCounters = new Map();     // cap diario por sesión
-const pauseMap = new Map();          // pausa temporal por errores
-const optOut = new Set();            // opt-out simple en memoria
+const sessionLocks = new Map();
+const reconnectState = new Map();
+const lastForce = new Map();
+const dailyCounters = new Map();
+const pauseMap = new Map();
+const optOut = new Set();
 
-function upsertSession(sessionId, patch) {
-  const prev = sessions.get(sessionId) || {};
-  const next = { ...prev, ...patch, lastUpdate: Date.now() };
-  sessions.set(sessionId, next);
-  const keysPatched = Object.keys(patch);
-  console.log(`[${sessionId}] 🧩 upsertSession -> patched: ${keysPatched.join(', ') || 'none'}`);
-  return next;
+const lastInbound = new Map();   
+const lastSentTo = new Map();   
+const recentBroadcasts = [];     
+
+const cooldowns = new Map();
+function now() { return Date.now(); }
+function msLeft(until) { return Math.max(0, until - now()); }
+function fmtMs(ms) {
+  const s = Math.ceil(ms/1000);
+  if (s < 60) return `${s}s`;
+  const m = Math.floor(s/60), r = s%60;
+  if (m < 60) return `${m}m${r?` ${r}s`:''}`;
+  const h = Math.floor(m/60), mr = m%60;
+  return `${h}h${mr?` ${mr}m`:''}`;
+}
+function checkCooldown(key) {
+  const entry = cooldowns.get(key);
+  if (!entry) return { cooling: false, remaining: 0 };
+  const remaining = msLeft(entry.until);
+  if (remaining <= 0) { cooldowns.delete(key); return { cooling: false, remaining: 0 }; }
+  return { cooling: true, remaining, reason: entry.reason, strikes: entry.strikes || 0 };
+}
+function setCooldown(key, baseMs, reason = 'cooldown') {
+  const prev = cooldowns.get(key);
+  const strikes = (prev?.strikes || 0) + 1;
+  const mult = [1, 2, 3, 4][Math.min(strikes-1, 3)];
+  const duration = Math.min(baseMs * mult, 60 * 60 * 1000);
+  const until = now() + duration;
+  cooldowns.set(key, { until, reason, strikes, lastSet: now() });
+  return { strikes, duration };
+}
+function clearCooldown(key) { cooldowns.delete(key); }
+const cdKeys = {
+  session: (sessionId) => `cd:session:${sessionId}`,
+  contact: (sessionId, jid) => `cd:contact:${sessionId}:${jid}`,
+  antiblast: (sessionId) => `cd:antiblast:${sessionId}`,
+};
+
+const outbox = new Map(); 
+let JOB_SEQ = 0;
+
+const CONTACT_COOLDOWN_BASE_MS = 30_000;
+const RAPID_FIRE_WINDOW_MS     = 15_000;
+const RAPID_FIRE_COOLDOWN_MS   = 2 * 30_000;
+const ANTIBLAST_COOLDOWN_MS    = 10 * 30_000;
+const RECENT_INBOUND_MS        = 15_000;
+const ACCOUNT_WARMUP_DAYS      = 10;
+
+function outboxKey(sessionId, jid) { return `${sessionId}:${jid}`; }
+function enqueueMessage(sessionId, jid, text) {
+  const key = outboxKey(sessionId, jid);
+  const q = outbox.get(key) || [];
+  const id = `job_${++JOB_SEQ}`;
+  const job = { id, sessionId, jid, text, attempts: 0, createdAt: Date.now() };
+  q.push(job);
+  outbox.set(key, q);
+  console.log(`[${sessionId}] 📬 Encolado ${id} para ${jid} (len=${q.length})`);
+  return job;
+}
+function dequeueMessage(job) {
+  const key = outboxKey(job.sessionId, job.jid);
+  const q = outbox.get(key) || [];
+  const idx = q.findIndex(j => j.id === job.id);
+  if (idx >= 0) q.splice(idx, 1);
+  outbox.set(key, q);
+}
+function peekMessage(sessionId, jid) {
+  const q = outbox.get(outboxKey(sessionId, jid)) || [];
+  return q[0] || null;
 }
 
-async function withLock(id, fn) {
-  const prev = sessionLocks.get(id) || Promise.resolve();
-  let release;
-  const p = new Promise((res) => (release = res));
-  sessionLocks.set(id, prev.then(() => p));
-  try { return await fn(); } finally { release(); sessionLocks.delete(id); }
-}
-
-function nextDelay(id) {
-  const s = reconnectState.get(id) || { attempts: 0, lastTs: 0 };
-  s.attempts = Math.min(s.attempts + 1, 8);
-  reconnectState.set(id, s);
-  const base = Math.min(1000 * Math.pow(2, s.attempts - 1), 60000); // 1s..60s
-  return jitter(base, 0.5);
-}
-function resetBackoff(id) { reconnectState.delete(id); }
-
-function withinBusinessHours(tzOffset = -5) { // Colombia
+function withinBusinessHours(tzOffset = -5) {
   const d = new Date();
   const h = d.getUTCHours() + tzOffset;
   const hour = (h + 24) % 24;
   return hour >= 8 && hour <= 21;
 }
-function canSendToday(sessionId, limit = 400) {
+function dynamicDailyCap(sessionId, baseCap = 120, maxCap = 600) {
+  const s = sessions.get(sessionId);
+  const started = s?.startedAt || Date.now();
+  const days = Math.max(1, Math.floor((Date.now() - started) / (24*60*60*1000)));
+  const factor = Math.min(1, days / ACCOUNT_WARMUP_DAYS);
+  return Math.round(baseCap + (maxCap - baseCap) * factor);
+}
+function canSendToday(sessionId, limit) {
   const key = new Date().toISOString().slice(0,10);
   const cur = dailyCounters.get(sessionId) || { dateKey: key, count: 0 };
   if (cur.dateKey !== key) { cur.dateKey = key; cur.count = 0; }
@@ -191,39 +233,174 @@ function isPaused(sessionId) {
 function pause(sessionId, ms = 5*60*1000) {
   pauseMap.set(sessionId, Date.now() + ms);
 }
+const pauseEscalation = new Map();
+function escalatePause(sessionId) {
+  const cur = (pauseEscalation.get(sessionId) || 0) + 1;
+  pauseEscalation.set(sessionId, cur);
+  const mins = [1, 5, 15, 60][Math.min(cur-1, 3)];
+  const ms = mins * 60_000;
+  pause(sessionId, ms);
+  console.warn(`[${sessionId}] ⏸️ Pausa escalada por ${mins}min (strikes=${cur})`);
+}
 
-/* ========= Token-bucket Rate Limiter ========= */
-const buckets = new Map(); // key -> {tokens, last}
+const buckets = new Map();
+const RL_SESSION_CAPACITY = 6;
+const RL_SESSION_REFILL   = 1;
+const RL_JID_CAPACITY     = 3;
+const RL_JID_REFILL       = 0.25;
 function tokenBucket(key, capacity, refillPerSec) {
-  const now = Date.now();
-  const b = buckets.get(key) || { tokens: capacity, last: now };
-  const elapsed = (now - b.last) / 1000;
+  const nowTs = Date.now();
+  const b = buckets.get(key) || { tokens: capacity, last: nowTs };
+  const elapsed = (nowTs - b.last) / 1000;
   b.tokens = Math.min(capacity, b.tokens + elapsed * refillPerSec);
-  b.last = now;
+  b.last = nowTs;
   const ok = b.tokens >= 1;
   if (ok) b.tokens -= 1;
   buckets.set(key, b);
   return ok;
 }
 function canSendRate(sessionId, jid) {
-  const okSession = tokenBucket(`s:${sessionId}`, 10, 2);     // máx 10, repone 2/s
-  const okJid     = tokenBucket(`j:${sessionId}:${jid}`, 5, 0.5); // máx 5, repone 0.5/s
+  const okSession = tokenBucket(`s:${sessionId}`, RL_SESSION_CAPACITY, RL_SESSION_REFILL);
+  const okJid     = tokenBucket(`j:${sessionId}:${jid}`, RL_JID_CAPACITY, RL_JID_REFILL);
   return okSession && okJid;
 }
 
-/* ========= Human-like typing ========= */
 async function simulateHumanTyping(sock, jid, text) {
   try {
     await sock.presenceSubscribe(jid);
     await sock.sendPresenceUpdate('available', jid);
     await sock.sendPresenceUpdate('composing', jid);
-    const base = Math.min(2500, 150 + (text.length * 15));
+    const base = Math.min(3000, 300 + (text.length * 18));
     await wait(jitter(base));
     await sock.sendPresenceUpdate('paused', jid);
-  } catch (_) { /* no bloquear por presence */ }
+  } catch (_) {}
 }
 
-/* ========= Core: start session ========= */
+const typingBursts = new Map(); 
+async function typingBurst(sessionId, jid, durationMs = 2200) {
+  const s = sessions.get(sessionId);
+  if (!s?.sock) return;
+  try {
+    await s.sock.presenceSubscribe(jid);
+    await s.sock.sendPresenceUpdate('available', jid);
+    await s.sock.sendPresenceUpdate('composing', jid);
+    const dur = Math.max(900, Math.min(3500, durationMs));
+    await wait(jitter(dur, 0.3));
+    await s.sock.sendPresenceUpdate('paused', jid);
+  } catch (_) {}
+}
+function scheduleTypingBurst(sessionId, jid, etaMs) {
+  const k = `${sessionId}:${jid}`;
+  const prev = typingBursts.get(k) || [];
+  prev.forEach((id) => { try { clearTimeout(id); } catch {} });
+  const timers = [];
+  const t1 = Math.max(etaMs - 7000, 0);
+  const t2 = Math.max(etaMs - 2000, 0);
+  if (etaMs > 1500 && t1 > 0) timers.push(setTimeout(() => typingBurst(sessionId, jid, 2200), t1));
+  if (etaMs > 800 && t2 > 0)  timers.push(setTimeout(() => typingBurst(sessionId, jid, 1600), t2));
+  typingBursts.set(k, timers);
+}
+function clearTypingBursts(sessionId, jid) {
+  const k = `${sessionId}:${jid}`;
+  const arr = typingBursts.get(k) || [];
+  arr.forEach((id) => { try { clearTimeout(id); } catch {} });
+  typingBursts.delete(k);
+}
+
+function registerBroadcast(sessionId, text, jid) {
+  const nowTs = Date.now();
+  recentBroadcasts.push({ t: nowTs, sessionId, text: (text||'').trim(), jid });
+  while (recentBroadcasts.length && (nowTs - recentBroadcasts[0].t) > (10 * 60_000)) {
+    recentBroadcasts.shift();
+  }
+}
+function looksLikeBlast(sessionId, text) {
+  const norm = (text||'').trim();
+  if (!norm) return false;
+  const nowTs = Date.now();
+  const win = recentBroadcasts.filter(r =>
+    r.sessionId === sessionId &&
+    (nowTs - r.t) <= (10 * 60_000) &&
+    r.text === norm
+  );
+  const unique = new Set(win.map(w => w.jid));
+  return unique.size >= 8;
+}
+function hadRecentInbound(sessionId, jid, hours = 48) {
+  const ts = lastInbound.get(`${sessionId}:${jid}`) || 0;
+  return (Date.now() - ts) <= (hours * 60 * 60 * 1000);
+}
+function containsLink(s='') { return /\bhttps?:\/\/|\bwww\./i.test(s); }
+
+async function trySendJob(job) {
+  job.attempts++;
+  const { sessionId, jid, text } = job;
+
+  const sessCD = checkCooldown(cdKeys.session(sessionId));
+  if (sessCD.cooling) {
+    const delay = sessCD.remaining + jitter(250, 0.4);
+    return scheduleJob(job, delay);
+  }
+  const contactCD = checkCooldown(cdKeys.contact(sessionId, jid));
+  if (contactCD.cooling) {
+    const delay = contactCD.remaining + jitter(250, 0.4);
+    return scheduleJob(job, delay);
+  }
+  const s = sessions.get(sessionId);
+  if (!s || !s.sock || s.status !== 'active') {
+    return scheduleJob(job, 5_000);
+  }
+
+  try {
+    await simulateHumanTyping(s.sock, jid, text);
+    await wait(jitter(600, 0.6));
+    const r = await s.sock.sendMessage(jid, { text: text.trim() });
+
+    registerBroadcast(sessionId, text, jid);
+    lastSentTo.set(`${sessionId}:${jid}`, Date.now());
+
+    dequeueMessage(job);
+    clearTypingBursts(sessionId, jid);
+    console.log(`[${sessionId}] ✅ ${job.id} enviado -> id=${r?.key?.id}`);
+  } catch (e) {
+    console.error(`[${sessionId}] ❌ ${job.id} fallo envío:`, e?.message || e);
+    setCooldown(cdKeys.contact(sessionId, jid), RAPID_FIRE_COOLDOWN_MS, 'retry_after_error');
+    scheduleJob(job, RAPID_FIRE_COOLDOWN_MS + jitter(300, 0.5));
+  }
+}
+function scheduleJob(job, delayMs) {
+  scheduleTypingBurst(job.sessionId, job.jid, delayMs);
+
+  setTimeout(() => {
+    const head = peekMessage(job.sessionId, job.jid);
+    if (!head || head.id !== job.id) return;
+    trySendJob(job);
+  }, Math.max(0, delayMs));
+}
+
+function upsertSession(sessionId, patch) {
+  const prev = sessions.get(sessionId) || {};
+  const next = { ...prev, ...patch, lastUpdate: Date.now() };
+  sessions.set(sessionId, next);
+  console.log(`[${sessionId}] 🧩 upsertSession -> patched: ${Object.keys(patch).join(', ') || 'none'}`);
+  return next;
+}
+async function withLock(id, fn) {
+  const prev = sessionLocks.get(id) || Promise.resolve();
+  let release;
+  const p = new Promise((res) => (release = res));
+  sessionLocks.set(id, prev.then(() => p));
+  try { return await fn(); } finally { release(); sessionLocks.delete(id); }
+}
+function nextDelay(id) {
+  const s = reconnectState.get(id) || { attempts: 0, lastTs: 0 };
+  s.attempts = Math.min(s.attempts + 1, 8);
+  reconnectState.set(id, s);
+  const base = Math.min(1000 * Math.pow(2, s.attempts - 1), 60000);
+  return jitter(base, 0.5);
+}
+function resetBackoff(id) { reconnectState.delete(id); }
+
 async function startSession(sessionId) {
   return withLock(sessionId, async () => {
     console.log(`[${sessionId}] ▶️ startSession() llamado`);
@@ -243,52 +420,40 @@ async function startSession(sessionId) {
         : ['Chrome', 'Linux', '110.0.0'];
 
     let version;
-    try {
-      ({ version } = await fetchLatestBaileysVersion());
-    } catch {
-      version = [2, 3000, 0]; // fallback razonable
-    }
+    try { ({ version } = await fetchLatestBaileysVersion()); }
+    catch { version = [2, 3000, 0]; }
     console.log(`[${sessionId}] 📦 Baileys version negociada: ${version?.join?.('.') || version}`);
 
     const sock = makeWASocket({
       version,
       browser: browserInfo,
-      auth: {
-        creds: state.creds,
-        keys: makeCacheableSignalKeyStore(state.keys),
-      },
+      auth: { creds: state.creds, keys: makeCacheableSignalKeyStore(state.keys) },
       syncFullHistory: false,
     });
 
     upsertSession(sessionId, {
-      sock,
-      qr: null,
-      qrAt: null,
+      sock, qr: null, qrAt: null,
       status: 'connecting',
       startedAt: Date.now(),
     });
 
-    sock.ev.on('creds.update', (...args) => {
-      console.log(`[${sessionId}] 💾 creds.update`);
-      saveCreds(...args);
-    });
+    sock.ev.on('creds.update', (...args) => { console.log(`[${sessionId}] 💾 creds.update`); saveCreds(...args); });
 
-    // Watchdog de QR
     const existingTimer = existing?.qrTimer;
-    if (existingTimer) { try { clearInterval(existingTimer); } catch (_) {} }
+    if (existingTimer) { try { clearInterval(existingTimer); } catch {} }
     const qrTimer = setInterval(() => {
       const s = sessions.get(sessionId);
-      if (!s) { try { clearInterval(qrTimer); } catch (_) {} return; }
+      if (!s) { try { clearInterval(qrTimer); } catch {} return; }
       const stillWaiting = s.status !== 'active';
-      const now = Date.now();
+      const nowTs = Date.now();
       const qrExpired =
-        (s.qrAt && (now - s.qrAt) > QR_TTL_MS) ||
-        (!s.qrAt && s.startedAt && (now - s.startedAt) > QR_TTL_MS);
+        (s.qrAt && (nowTs - s.qrAt) > QR_TTL_MS) ||
+        (!s.qrAt && s.startedAt && (nowTs - s.startedAt) > QR_TTL_MS);
       if (stillWaiting && qrExpired) {
         console.log(`[${sessionId}] ⏲️ QR expirado; reiniciando socket para forzar nuevo QR`);
-        try { s.qr = null; } catch (_) {}
-        try { s.qrAt = null; } catch (_) {}
-        try { s.sock?.ws?.close?.(); } catch (_) {}
+        try { s.qr = null; } catch {}
+        try { s.qrAt = null; } catch {}
+        try { s.sock?.ws?.close?.(); } catch {}
       }
     }, WATCHDOG_INTERVAL_MS);
     upsertSession(sessionId, { qrTimer });
@@ -297,7 +462,7 @@ async function startSession(sessionId) {
       if (qr) {
         console.log(`[${sessionId}] 🔐 QR recibido a las ${new Date().toISOString()}`);
         upsertSession(sessionId, { qr, qrAt: Date.now() });
-        try { qrcode.generate(qr, { small: true }); } catch (_) {}
+        try { qrcode.generate(qr, { small: true }); } catch {}
       }
 
       if (connection) console.log(`[${sessionId}] 📡 Estado conexión: ${connection}`);
@@ -339,26 +504,27 @@ async function startSession(sessionId) {
         console.log(`[${sessionId}] ✅ Sesión activa`);
         resetBackoff(sessionId);
         const s = upsertSession(sessionId, { status: 'active', qr: null, qrAt: null });
-        try { clearInterval(s.qrTimer); } catch (_) {}
+        try { clearInterval(s.qrTimer); } catch {}
         upsertSession(sessionId, { qrTimer: null });
       }
     });
 
-    // Inbound handler + opt-out + media download
     sock.ev.on('messages.upsert', async ({ messages }) => {
       const m = messages?.[0];
       if (!m || m.key.fromMe) return;
+
+      try { await sock.readMessages([m.key]); } catch {}
 
       const from = m.key.remoteJid || '';
       const msg = m.message || {};
       const type = getContentType(msg) || Object.keys(msg || {}).join(',') || 'unknown';
       const text = extractTextFromMessage(msg) || '';
 
-      console.log(
-        `[${sessionId}] ✉️ inbound from=${from} type=${type} keys=${Object.keys(msg || {}).join(',')}`
-      );
+      console.log(`[${sessionId}] ✉️ inbound from=${from} type=${type} keys=${Object.keys(msg || {}).join(',')}`);
 
-      // Opt-out básico
+      lastInbound.set(`${sessionId}:${from}`, Date.now());
+      clearCooldown(cdKeys.contact(sessionId, from));
+
       const low = (text || '').trim().toLowerCase();
       if (['stop', 'salir', 'baja', 'no molestar'].includes(low)) {
         optOut.add(from);
@@ -367,22 +533,18 @@ async function startSession(sessionId) {
       }
       if (optOut.has(from)) return;
 
-      // Construir payload base
       const basePayload = {
         sessionId,
         from,
         messageId: m.key.id,
         timestamp: (m.messageTimestamp || 0) * 1000,
-        type,
-        text
+        type, text
       };
 
-      // Si es media, descargar y adjuntar
       let mediaPayload = null;
       try {
         if (['imageMessage','videoMessage','audioMessage','documentMessage','stickerMessage'].includes(type)) {
-          const nodeForDownload =
-            msg?.ephemeralMessage?.message || msg; // en caso de mensajes efímeros
+          const nodeForDownload = msg?.ephemeralMessage?.message || msg;
           const buffer = await downloadMediaMessage(
             { ...m, message: nodeForDownload },
             'buffer',
@@ -390,7 +552,6 @@ async function startSession(sessionId) {
             { reuploadRequest: sock.updateMediaMessage }
           );
 
-          // metadatos por tipo
           let mime = 'application/octet-stream';
           let caption = '';
           let suggestedName = `wa_${m.key.id}`;
@@ -414,7 +575,7 @@ async function startSession(sessionId) {
           const base64 = Buffer.from(buffer).toString('base64');
 
           mediaPayload = {
-            kind: type.replace('Message',''), // image, video, audio, document, sticker
+            kind: type.replace('Message',''),
             mime,
             bytes: buffer.length,
             base64,
@@ -426,11 +587,9 @@ async function startSession(sessionId) {
         console.error(`[${sessionId}] ⚠️ Error descargando media:`, e?.message || e);
       }
 
-      // Reenvío a n8n con reintentos
       if (N8N_INCOMING_WEBHOOK) {
         try {
           const payload = mediaPayload ? { ...basePayload, media: mediaPayload } : basePayload;
-
           await (async function postToN8N(p) {
             const max = 3;
             for (let i = 1; i <= max; i++) {
@@ -448,10 +607,7 @@ async function startSession(sessionId) {
               }
             }
           })(payload);
-
-          console.log(
-            `[${sessionId}] 🔁 reenviado a n8n (type=${type} textLen=${text?.length || 0} media=${!!mediaPayload})`
-          );
+          console.log(`[${sessionId}] 🔁 reenviado a n8n (type=${type} textLen=${text?.length || 0} media=${!!mediaPayload})`);
         } catch (e) {
           console.error(`[${sessionId}] ⚠️ Error enviando a n8n:`, e?.message || e);
         }
@@ -463,15 +619,14 @@ async function startSession(sessionId) {
   });
 }
 
-/* ========= Helpers ========= */
 async function forceQR(sessionId) {
-  const now = Date.now();
+  const nowTs = Date.now();
   const last = lastForce.get(sessionId) || 0;
-  if (now - last < 60_000) {
+  if (nowTs - last < 60_000) {
     console.log(`[${sessionId}] ⏳ forceQR throttled`);
     return sessions.get(sessionId) || await startSession(sessionId);
   }
-  lastForce.set(sessionId, now);
+  lastForce.set(sessionId, nowTs);
 
   console.log(`[${sessionId}] ♻️ forceQR() llamado`);
   let s = sessions.get(sessionId);
@@ -481,16 +636,15 @@ async function forceQR(sessionId) {
     return sessions.get(sessionId);
   }
   console.log(`[${sessionId}] forceQR() -> refrescando QR`);
-  try { s.qr = null; } catch (_) {}
-  try { s.qrAt = null; } catch (_) {}
-  try { s.sock?.ws?.close?.(); } catch (_) {}
+  try { s.qr = null; } catch {}
+  try { s.qrAt = null; } catch {}
+  try { s.sock?.ws?.close?.(); } catch {}
   upsertSession(sessionId, { sock: null, status: 'connecting' });
   await startSession(sessionId);
   console.log(`[${sessionId}] forceQR() -> completado`);
   return sessions.get(sessionId);
 }
 
-/* ========= Routes ========= */
 app.post('/sessions/:id/start', async (req, res) => {
   console.log(`[${req.rid}] [ROUTE] POST /sessions/:id/start id=${req.params.id}`);
   try {
@@ -581,10 +735,10 @@ app.delete('/sessions/:id', async (req, res) => {
     if (s?.sock) {
       console.log(`[${req.rid}] logout/end socket`);
       await s.sock.logout().catch(() => {});
-      try { s.sock.end?.(); } catch (_) {}
-      try { s.sock.ws?.close?.(); } catch (_) {}
+      try { s.sock.end?.(); } catch {}
+      try { s.sock.ws?.close?.(); } catch {}
     }
-    try { clearInterval(s?.qrTimer); } catch (_) {}
+    try { clearInterval(s?.qrTimer); } catch {}
   } finally {
     sessions.delete(id);
     const dir = path.join(AUTH_ROOT, id);
@@ -607,10 +761,10 @@ app.post('/sessions/:id/reset', async (req, res) => {
     if (s?.sock) {
       console.log(`[${req.rid}] reset -> logout/end socket`);
       await s.sock.logout().catch(() => {});
-      try { s.sock.end?.(); } catch (_) {}
-      try { s.sock.ws?.close?.(); } catch (_) {}
+      try { s.sock.end?.(); } catch {}
+      try { s.sock.ws?.close?.(); } catch {}
     }
-    try { clearInterval(s?.qrTimer); } catch (_) {}
+    try { clearInterval(s?.qrTimer); } catch {}
     sessions.delete(id);
 
     if (fs.existsSync(dir)) {
@@ -634,7 +788,7 @@ app.post('/messages', async (req, res) => {
     if (!sessionId || !to || typeof text !== 'string' || !text.trim()) {
       return res.status(400).json({ error: 'invalid_payload' });
     }
-    if (!withinBusinessHours(-5)) { // 🇨🇴 Ajusta si necesitas otro TZ
+    if (!withinBusinessHours(-5)) {
       return res.status(423).json({ error: 'outside_business_hours' });
     }
     if (isPaused(sessionId)) {
@@ -648,34 +802,120 @@ app.post('/messages', async (req, res) => {
     const jid = to.includes('@') ? to : `${to}@s.whatsapp.net`;
     if (optOut.has(jid)) return res.status(403).json({ error: 'recipient_opted_out' });
 
+    if (looksLikeBlast(sessionId, text)) {
+      const { duration, strikes } = setCooldown(cdKeys.session(sessionId), ANTIBLAST_COOLDOWN_MS, 'anti_blast');
+      return res.status(429).json({ error: 'anti_blast_triggered', retry_in_ms: duration, strikes });
+    }
+    const recentConv = hadRecentInbound(sessionId, jid, 48);
+    if (!recentConv && containsLink(text)) {
+      return res.status(400).json({ error: 'no_links_on_cold_start' });
+    }
+
+    const cdContactKey = cdKeys.contact(sessionId, jid);
+
+    const inboundTs = lastInbound.get(`${sessionId}:${jid}`) || 0;
+    const sinceInbound = Date.now() - inboundTs;
+    if (sinceInbound > 0 && sinceInbound < RECENT_INBOUND_MS) {
+      const remaining = Math.max(CONTACT_COOLDOWN_BASE_MS - sinceInbound, 5_000);
+      setCooldown(cdContactKey, remaining, 'recent_inbound');
+      const job = enqueueMessage(sessionId, jid, text);
+      const eta = remaining + jitter(200, 0.5);
+      scheduleTypingBurst(sessionId, jid, eta);
+      scheduleJob(job, eta);
+      return res.status(202).json({ queued: true, jobId: job.id, reason: 'recent_inbound', retry_in_ms: remaining });
+    }
+
+    {
+      const { cooling, remaining, reason } = checkCooldown(cdContactKey);
+      if (cooling) {
+        const job = enqueueMessage(sessionId, jid, text);
+        const eta = remaining + jitter(200, 0.5);
+        scheduleTypingBurst(sessionId, jid, eta);
+        scheduleJob(job, eta);
+        return res.status(202).json({ queued: true, jobId: job.id, reason: reason || 'contact_cooldown', retry_in_ms: remaining });
+      }
+    }
+
+    {
+      const k = `${sessionId}:${jid}`;
+      const last = lastSentTo.get(k) || 0;
+      if (Date.now() - last < RAPID_FIRE_WINDOW_MS) {
+        const { duration } = setCooldown(cdContactKey, RAPID_FIRE_COOLDOWN_MS, 'rapid_fire_contact');
+        const job = enqueueMessage(sessionId, jid, text);
+        const eta = duration + jitter(200, 0.5);
+        scheduleTypingBurst(sessionId, jid, eta);
+        scheduleJob(job, eta);
+        return res.status(202).json({ queued: true, jobId: job.id, reason: 'rapid_fire_contact', retry_in_ms: duration });
+      }
+    }
+
     if (!canSendRate(sessionId, jid)) {
       return res.status(429).json({ error: 'rate_limited' });
     }
-    if (!canSendToday(sessionId, 400)) {
+
+    const todaysCap = dynamicDailyCap(sessionId, 120, 600);
+    if (!canSendToday(sessionId, todaysCap)) {
       return res.status(429).json({ error: 'daily_cap_reached' });
     }
 
     await simulateHumanTyping(s.sock, jid, text);
+    await wait(jitter(600, 0.6));
     const r = await s.sock.sendMessage(jid, { text: text.trim() });
+
+    registerBroadcast(sessionId, text, jid);
+    lastSentTo.set(`${sessionId}:${jid}`, Date.now());
+    clearTypingBursts(sessionId, jid);
+
     console.log(`[${req.rid}] send -> ok id=${r?.key?.id}`);
     res.json({ ok: true, response: r });
   } catch (e) {
     console.error(`[${req.rid}] send_failed:`, e?.message || e);
-    // si es un error de autorización / patrón raro, pausa la sesión unos minutos
-    if (String(e?.message || '').toLowerCase().includes('not-authorized')) {
-      pause(req.body?.sessionId);
+    const sessionId = req.body?.sessionId;
+    const msg = String(e?.message || '');
+    if (msg.toLowerCase().includes('not-authorized') ||
+        msg.toLowerCase().includes('blocked') ||
+        msg.includes('429')) {
+      escalatePause(sessionId);
+      setCooldown(cdKeys.session(sessionId), 5 * 60_000, 'provider_signal_risk');
     }
     res.status(500).json({ error: 'send_failed' });
   }
 });
 
-/* ========= Health ========= */
 app.get('/health', (req, res) => {
   console.log(`[${req.rid}] [ROUTE] GET /health`);
   res.json({ ok: true });
 });
 
-/* ========= Listen + graceful shutdown ========= */
+app.get('/debug/outbox', (req, res) => {
+  const out = [];
+  for (const [key, q] of outbox.entries()) {
+    out.push({
+      key,
+      size: q.length,
+      jobs: q.map(j => ({ id: j.id, createdAt: new Date(j.createdAt).toISOString(), attempts: j.attempts }))
+    });
+  }
+  res.json(out);
+});
+
+app.get('/debug/cooldowns', (req, res) => {
+  const out = [];
+  for (const [key, v] of cooldowns.entries()) {
+    const remaining = msLeft(v.until);
+    if (remaining <= 0) continue;
+    out.push({
+      key,
+      reason: v.reason,
+      strikes: v.strikes,
+      remaining_ms: remaining,
+      remaining_pretty: fmtMs(remaining),
+      last_set_at: new Date(v.lastSet).toISOString()
+    });
+  }
+  res.json(out.sort((a,b) => b.remaining_ms - a.remaining_ms));
+});
+
 const server = app.listen(PORT, () => {
   console.log(`🚀 WA Gateway escuchando en http://localhost:${PORT}`);
   if (openapi) console.log(`📑 Docs disponibles en http://localhost:${PORT}/docs`);
